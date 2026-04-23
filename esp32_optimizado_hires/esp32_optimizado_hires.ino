@@ -1,4 +1,5 @@
 #include "esp_camera.h"
+#include "img_converters.h"
 #include <HardwareSerial.h>
 #include <esp_task_wdt.h>
 
@@ -158,48 +159,140 @@ void IRAM_ATTR capture_and_send_stream() {
 }
 
 void capture_and_filter(const char *filter_name) {
-  sensor_t * s = esp_camera_sensor_get();
-  if (!s) {
-      Serial.println("DEBUG: Error obteniendo el sensor de hardware");
-      return;
-  }
-
-  s->set_special_effect(s, 0);
-  s->set_contrast(s, 0);
-  s->set_brightness(s, 0);
-  s->set_saturation(s, 0);
-  s->set_wb_mode(s, 0);
-  s->set_colorbar(s, 0);
-
-  if (strcmp(filter_name, "invert") == 0) s->set_special_effect(s, 1);
-  else if (strcmp(filter_name, "grayscale") == 0) s->set_special_effect(s, 2);
-  else if (strcmp(filter_name, "red_tint") == 0) s->set_special_effect(s, 3);
-  else if (strcmp(filter_name, "green_tint") == 0) s->set_special_effect(s, 4);
-  else if (strcmp(filter_name, "blue_tint") == 0) s->set_special_effect(s, 5);
-  else if (strcmp(filter_name, "sepia") == 0) s->set_special_effect(s, 6);
-  else if (strcmp(filter_name, "contraste") == 0) s->set_contrast(s, 2);
-  else if (strcmp(filter_name, "soleado") == 0) s->set_wb_mode(s, 1);
-  else if (strcmp(filter_name, "test_patron") == 0) s->set_colorbar(s, 1); 
-  
-  delay(300); 
-
   camera_fb_t *fb = esp_camera_fb_get();
-  if (!fb) {
-      Serial.println("DEBUG: Fallo al obtener frame JPEG");
-      s->set_special_effect(s, 0); 
+  if (!fb) return;
+
+  if (strcmp(filter_name, "original") == 0) {
+      Serial.println("CAPTURE_START");
+      Serial.write(fb->buf, fb->len);
+      Serial.println("\nCAPTURE_END");
+      esp_camera_fb_return(fb);
       return;
   }
-  
+
+  // Reservar RAM para transformar JPEG a pixel RGB (pesado para ESP32)
+  uint8_t *rgb_buf = (uint8_t *)malloc(fb->width * fb->height * 3);
+  if (!rgb_buf) {
+      Serial.println("DEBUG: Memoria insuficiente para RGB");
+      esp_camera_fb_return(fb);
+      return;
+  }
+
+  fmt2rgb888(fb->buf, fb->len, fb->format, rgb_buf);
+  int w = fb->width, h = fb->height, len = w * h * 3;
+
+  // --- FILTROS 100% C++ EN ESP32 ---
+  // Nota: El decodificador JPEG de la OV2640 en el ESP32 guarda los colores en orden BGR
+  // (Azul = i, Verde = i+1, Rojo = i+2)
+  if (strcmp(filter_name, "invert") == 0) {
+      for (int i = 0; i < len; i++) rgb_buf[i] = 255 - rgb_buf[i];
+  } 
+  else if (strcmp(filter_name, "grayscale") == 0) {
+      for (int i = 0; i < len; i += 3) {
+          uint8_t g = (rgb_buf[i]*1 + rgb_buf[i+1]*6 + rgb_buf[i+2]*3) / 10;
+          rgb_buf[i] = rgb_buf[i+1] = rgb_buf[i+2] = g;
+      }
+  } 
+  else if (strcmp(filter_name, "sepia") == 0) {
+      for (int i = 0; i < len; i += 3) {
+          int b = rgb_buf[i], g = rgb_buf[i+1], r = rgb_buf[i+2]; // Leer BGR real
+          rgb_buf[i+2] = min(255, (int)(r*.393 + g*.769 + b*.189)); // R
+          rgb_buf[i+1] = min(255, (int)(r*.349 + g*.686 + b*.168)); // G
+          rgb_buf[i]   = min(255, (int)(r*.272 + g*.534 + b*.131)); // B
+      }
+  }
+  else if (strcmp(filter_name, "red_tint") == 0) {
+      for (int i = 0; i < len; i += 3) {
+          rgb_buf[i+2] = min(255, rgb_buf[i+2] + 80); // Sumar a Rojo (i+2)
+          rgb_buf[i+1] = max(0, (int)rgb_buf[i+1] - 40); // Restar Verde
+          rgb_buf[i]   = max(0, (int)rgb_buf[i] - 40); // Restar Azul (i)
+      }
+  }
+  else if (strcmp(filter_name, "green_tint") == 0) {
+      for (int i = 0; i < len; i += 3) {
+          rgb_buf[i+1] = min(255, rgb_buf[i+1] + 80); // Sumar Verde (i+1)
+          rgb_buf[i+2] = max(0, (int)rgb_buf[i+2] - 40); // Restar Rojo (i+2)
+          rgb_buf[i]   = max(0, (int)rgb_buf[i] - 40); // Restar Azul
+      }
+  }
+  else if (strcmp(filter_name, "blue_tint") == 0) {
+      for (int i = 0; i < len; i += 3) {
+          rgb_buf[i]   = min(255, rgb_buf[i] + 80); // Sumar Azul (i)
+          rgb_buf[i+2] = max(0, (int)rgb_buf[i+2] - 40); // Restar Rojo
+          rgb_buf[i+1] = max(0, (int)rgb_buf[i+1] - 40); // Restar Verde
+      }
+  }
+  else if (strcmp(filter_name, "contraste") == 0) {
+      float factor = 1.5;
+      for (int i = 0; i < len; i++) {
+          rgb_buf[i] = min(255, max(0, (int)(factor * ((int)rgb_buf[i] - 128) + 128)));
+      }
+  }
+  else if (strcmp(filter_name, "soleado") == 0) { // Simular calidez
+      for (int i = 0; i < len; i += 3) {
+          rgb_buf[i+2] = min(255, rgb_buf[i+2] + 40); // Sumar Rojo (i+2)
+          rgb_buf[i+1] = min(255, rgb_buf[i+1] + 20); // Sumar Verde
+          rgb_buf[i]   = max(0, (int)rgb_buf[i] - 20);  // Bajar Azul! (Filtro calido)
+      }
+  }
+  else if (strcmp(filter_name, "lineas") == 0) {
+      uint8_t *tmp = (uint8_t*)malloc(len);
+      if (tmp) {
+          for (int y = 0; y < h - 1; y++) {
+              for (int x = 0; x < w - 1; x++) {
+                  int idx = (y * w + x) * 3;
+                  int diff_x = abs(rgb_buf[idx] - rgb_buf[idx+3]);
+                  int diff_y = abs(rgb_buf[idx] - rgb_buf[idx + w*3]);
+                  uint8_t edge = (diff_x + diff_y > 40) ? 255 : 0;
+                  tmp[idx] = tmp[idx+1] = tmp[idx+2] = edge;
+              }
+          }
+          memcpy(rgb_buf, tmp, len);
+          free(tmp);
+      }
+  }
+  else if (strcmp(filter_name, "profundidad") == 0) {
+      for (int i = 0; i < len; i += 3) {
+          uint8_t g = (rgb_buf[i]*1 + rgb_buf[i+1]*6 + rgb_buf[i+2]*3) / 10;
+          // Mapa de calor térmico real (Jet Colormap clásico en C++)
+          uint8_t r = 0, gr = 0, b = 0;
+          if (g < 64) {
+              r = 0; gr = g * 4; b = 255;
+          } else if (g < 128) {
+              r = 0; gr = 255; b = 255 - (g - 64) * 4;
+          } else if (g < 192) {
+              r = (g - 128) * 4; gr = 255; b = 0;
+          } else {
+              r = 255; gr = 255 - (g - 192) * 4; b = 0;
+          }
+          rgb_buf[i+2] = r;  // Rojo
+          rgb_buf[i+1] = gr; // Verde
+          rgb_buf[i]   = b;  // Azul
+      }
+  }
+  else if (strcmp(filter_name, "test_patron") == 0) {
+      for (int y = 0; y < h; y++) {
+          for (int x = 0; x < w; x++) {
+              int i = (y * w + x) * 3;
+              if (x < w/3) { rgb_buf[i+2]=255; rgb_buf[i+1]=0; rgb_buf[i]=0; } // R
+              else if (x < 2*w/3) { rgb_buf[i+2]=0; rgb_buf[i+1]=255; rgb_buf[i]=0; } // G
+              else { rgb_buf[i+2]=0; rgb_buf[i+1]=0; rgb_buf[i]=255; } // B
+          }
+      }
+  }
+
+  // Comprimir de nuevo RGB888 a JPEG
+  uint8_t *jpg_buf = NULL;
+  size_t jpg_len = 0;
+  fmt2jpg(rgb_buf, len, w, h, PIXFORMAT_RGB888, 20, &jpg_buf, &jpg_len);
+
   Serial.println("CAPTURE_START");
-  Serial.write(fb->buf, fb->len);
+  if (jpg_buf != NULL && jpg_len > 0) {
+      Serial.write(jpg_buf, jpg_len);
+      free(jpg_buf);
+  }
   Serial.println("\nCAPTURE_END");
-  
+
+  free(rgb_buf);
   esp_camera_fb_return(fb);
-  
-  s->set_special_effect(s, 0);
-  s->set_contrast(s, 0);
-  s->set_brightness(s, 0);
-  s->set_saturation(s, 0);
-  s->set_wb_mode(s, 0);
-  s->set_colorbar(s, 0);
 }

@@ -73,18 +73,9 @@ with col_filtros:
                 st.session_state.esp32.ser.reset_output_buffer()
             
             with st.spinner("Procesando captura..."):
-                filtro_hw = "original" if filtro_seleccionado in ["lineas", "profundidad"] else filtro_seleccionado
-                frame_captura = st.session_state.esp32.capturar_con_filtro(filtro_hw)
+                frame_captura = st.session_state.esp32.capturar_con_filtro(filtro_seleccionado)
                 
                 if frame_captura is not None:
-                    if filtro_seleccionado == "lineas":
-                        gris = cv2.cvtColor(frame_captura, cv2.COLOR_BGR2GRAY)
-                        edges = cv2.Canny(gris, 100, 200) 
-                        frame_captura = cv2.cvtColor(edges, cv2.COLOR_GRAY2BGR)
-                    elif filtro_seleccionado == "profundidad":
-                        gris = cv2.cvtColor(frame_captura, cv2.COLOR_BGR2GRAY)
-                        frame_captura = cv2.applyColorMap(gris, cv2.COLORMAP_JET)
-
                     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                     nombre_archivo = f"{filtro_seleccionado}_{timestamp}.jpg"
                     ruta = GALERIA_DIR / nombre_archivo
